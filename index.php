@@ -1974,10 +1974,6 @@ try {
                 $varsList = json_decode($product->variations_json ?? '[]', true);
                 if (!is_array($varsList)) $varsList = [];
 
-                $retailPrice = getItemRetailPrice($product);
-                $wholesalePrice = getItemWholesalePrice($product);
-                $stockQty = intval($product->quantity_on_hand ?? $product->qty ?? 0);
-
                 $erpUrl = getErpBaseUrl();
                 $mainImgSrc = '';
                 if (!empty($product->image_path)) {
@@ -1986,16 +1982,134 @@ try {
                         ? $erpUrl . substr($imgPath, 7) 
                         : $erpUrl . 'uploads/products/' . $imgPath;
                 }
+
+                // Additional gallery images
+                $additionalImgList = [];
+                if (!empty($product->additional_images)) {
+                    $decodedAdd = json_decode($product->additional_images, true);
+                    if (is_array($decodedAdd)) {
+                        foreach ($decodedAdd as $addImg) {
+                            if (!empty($addImg)) {
+                                $additionalImgList[] = (strpos($addImg, 'public/') === 0) 
+                                    ? $erpUrl . substr($addImg, 7) 
+                                    : $erpUrl . 'uploads/products/' . $addImg;
+                            }
+                        }
+                    }
+                }
+
+                // Hydrate variations from database tables (item_variation_options & item_images)
+                try {
+                    $voStmt = $db->prepare("
+                        SELECT vo.*, vv.value_name 
+                        FROM item_variation_options vo 
+                        LEFT JOIN variation_values vv ON vo.variation_value_id = vv.id 
+                        WHERE vo.item_id = :id
+                    ");
+                    $voStmt->execute([':id' => $prodId]);
+                    $dbVarOpts = $voStmt->fetchAll();
+
+                    $imgStmt = $db->prepare("SELECT variation_value_id, image_path FROM item_images WHERE item_id = :id AND variation_value_id IS NOT NULL");
+                    $imgStmt->execute([':id' => $prodId]);
+                    $dbImgMap = [];
+                    foreach ($imgStmt->fetchAll() as $imgRow) {
+                        $dbImgMap[$imgRow->variation_value_id] = $imgRow->image_path;
+                    }
+
+                    if (!empty($dbVarOpts)) {
+                        $hydratedVars = [];
+                        foreach ($dbVarOpts as $vo) {
+                            $vImg = !empty($vo->image_path) ? $vo->image_path : ($dbImgMap[$vo->variation_value_id] ?? '');
+                            $hydratedVars[] = [
+                                'id' => $vo->id,
+                                'sku' => $vo->sku ?? ($product->item_code . '-' . $vo->id),
+                                'price' => floatval(($vo->price && $vo->price > 0) ? $vo->price : getItemRetailPrice($product)),
+                                'wholesale_price' => floatval(($vo->wholesale_price && $vo->wholesale_price > 0) ? $vo->wholesale_price : getItemWholesalePrice($product)),
+                                'qty' => intval($vo->quantity_on_hand ?? 0),
+                                'quantity_on_hand' => intval($vo->quantity_on_hand ?? 0),
+                                'attribute' => $vo->value_name ?? $vo->sku ?? 'Option',
+                                'image_path' => $vImg
+                            ];
+                        }
+                        if (!empty($hydratedVars)) {
+                            $varsList = $hydratedVars;
+                        }
+                    } else {
+                        foreach ($varsList as &$vItem) {
+                            if (empty($vItem['image_path']) && isset($vItem['variation_value_id']) && isset($dbImgMap[$vItem['variation_value_id']])) {
+                                $vItem['image_path'] = $dbImgMap[$vItem['variation_value_id']];
+                            }
+                        }
+                        unset($vItem);
+                    }
+                } catch (Exception $e) {
+                    logEcError("Failed to hydrate variation images for item {$prodId}: " . $e->getMessage());
+                }
+
+                // Initial default values (auto-preselect first variant if variations exist)
+                if (!empty($varsList)) {
+                    $firstVar = $varsList[0];
+                    $initialRetail = floatval($firstVar['price'] ?? getItemRetailPrice($product));
+                    $initialWholesale = floatval($firstVar['wholesale_price'] ?? getItemWholesalePrice($product));
+                    $initialSku = $firstVar['sku'] ?? $product->item_code ?? ('SKU-'.$product->id);
+                    $initialAttr = $firstVar['attribute'] ?? $firstVar['name'] ?? '';
+                    $initialStock = intval($firstVar['quantity_on_hand'] ?? $firstVar['qty'] ?? $firstVar['stock'] ?? 0);
+                    
+                    $vImgPath = $firstVar['image_path'] ?? $firstVar['image'] ?? $firstVar['img'] ?? '';
+                    if (!empty($vImgPath)) {
+                        $initialImg = (strpos($vImgPath, 'public/') === 0) ? $erpUrl . substr($vImgPath, 7) : $erpUrl . 'uploads/products/' . $vImgPath;
+                    } elseif (isset($additionalImgList[0])) {
+                        $initialImg = $additionalImgList[0];
+                    } else {
+                        $initialImg = $mainImgSrc;
+                    }
+                } else {
+                    $initialRetail = getItemRetailPrice($product);
+                    $initialWholesale = getItemWholesalePrice($product);
+                    $initialSku = $product->item_code ?? ('SKU-'.$product->id);
+                    $initialAttr = '';
+                    $initialStock = intval($product->quantity_on_hand ?? $product->qty ?? 0);
+                    $initialImg = $mainImgSrc;
+                }
+
+                // Compile all unique gallery thumbnails (Main + Additional + Variant Images)
+                $allGalleryThumbs = [];
+                if (!empty($mainImgSrc)) $allGalleryThumbs[] = $mainImgSrc;
+                foreach ($additionalImgList as $aUrl) {
+                    if (!in_array($aUrl, $allGalleryThumbs)) $allGalleryThumbs[] = $aUrl;
+                }
+                foreach ($varsList as $vObj) {
+                    $vPath = $vObj['image_path'] ?? $vObj['image'] ?? $vObj['img'] ?? '';
+                    if (!empty($vPath)) {
+                        $vUrl = (strpos($vPath, 'public/') === 0) ? $erpUrl . substr($vPath, 7) : $erpUrl . 'uploads/products/' . $vPath;
+                        if (!in_array($vUrl, $allGalleryThumbs)) {
+                            $allGalleryThumbs[] = $vUrl;
+                        }
+                    }
+                }
+
+                $activePrice = ($userRole === 'wholesaler' && $initialWholesale > 0) ? $initialWholesale : $initialRetail;
         ?>
             <div class="detail-layout">
                 <!-- Gallery Left -->
-                <div class="detail-gallery" id="mainGalleryContainer">
-                    <?php if(!empty($mainImgSrc)): ?>
-                        <img id="mainProductImage" src="<?= $mainImgSrc ?>" data-main-src="<?= $mainImgSrc ?>" alt="<?= htmlspecialchars($product->name) ?>">
-                        <i id="mainEmptyIcon" class="ph-light ph-image empty-img" style="display:none;"></i>
-                    <?php else: ?>
-                        <img id="mainProductImage" src="" data-main-src="" alt="<?= htmlspecialchars($product->name) ?>" style="display:none;">
-                        <i id="mainEmptyIcon" class="ph-light ph-image empty-img"></i>
+                <div class="detail-gallery" id="mainGalleryContainer" style="display: flex; flex-direction: column; align-items: center;">
+                    <div style="position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;">
+                        <?php if(!empty($initialImg)): ?>
+                            <img id="mainProductImage" src="<?= htmlspecialchars($initialImg) ?>" data-main-src="<?= htmlspecialchars($mainImgSrc) ?>" alt="<?= htmlspecialchars($product->name) ?>">
+                            <i id="mainEmptyIcon" class="ph-light ph-image empty-img" style="display:none;"></i>
+                        <?php else: ?>
+                            <img id="mainProductImage" src="" data-main-src="" alt="<?= htmlspecialchars($product->name) ?>" style="display:none;">
+                            <i id="mainEmptyIcon" class="ph-light ph-image empty-img"></i>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Gallery Thumbnails -->
+                    <?php if (count($allGalleryThumbs) > 1): ?>
+                        <div style="display: flex; gap: 10px; margin-top: 16px; overflow-x: auto; padding-bottom: 6px; width: 100%; justify-content: center; flex-wrap: wrap;">
+                            <?php foreach ($allGalleryThumbs as $thumbUrl): ?>
+                                <img src="<?= htmlspecialchars($thumbUrl) ?>" onclick="swapGalleryImage('<?= htmlspecialchars($thumbUrl, ENT_QUOTES) ?>')" style="width: 64px; height: 64px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); cursor: pointer; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+                            <?php endforeach; ?>
+                        </div>
                     <?php endif; ?>
                 </div>
 
@@ -2012,20 +2126,16 @@ try {
                     </div>
 
                     <h1 class="detail-title"><?= htmlspecialchars($product->name) ?></h1>
-                    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">SKU: <span id="skuDisplay"><?= htmlspecialchars($product->item_code ?? ('SKU-'.$product->id)) ?></span></div>
+                    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">SKU: <span id="skuDisplay"><?= htmlspecialchars($initialSku) ?></span></div>
 
                     <div class="detail-price-wrap" style="padding: 20px; background: var(--bg-subtle); border-radius: var(--radius-md); border: 1px solid var(--border-light);">
                         <div style="display: flex; align-items: baseline; gap: 12px;">
                             <div class="detail-price" id="priceDisplay">
-                                <?php if ($userRole === 'wholesaler' && $wholesalePrice > 0): ?>
-                                    Rs. <?= number_format($wholesalePrice, 2) ?>
-                                <?php else: ?>
-                                    Rs. <?= number_format($retailPrice, 2) ?>
-                                <?php endif; ?>
+                                Rs. <?= number_format($activePrice, 2) ?>
                             </div>
 
-                            <div id="retailCrossWrap" style="<?= ($userRole === 'wholesaler' && $wholesalePrice > 0) ? 'display:block;' : 'display:none;' ?>">
-                                <span class="price-cross" id="retailCrossPrice">Rs. <?= number_format($retailPrice, 2) ?></span>
+                            <div id="retailCrossWrap" style="<?= ($userRole === 'wholesaler' && $initialWholesale > 0) ? 'display:block;' : 'display:none;' ?>">
+                                <span class="price-cross" id="retailCrossPrice">Rs. <?= number_format($initialRetail, 2) ?></span>
                             </div>
                         </div>
 
@@ -2034,13 +2144,13 @@ try {
                                 <span class="badge-b2b"><i class="ph ph-check-circle"></i> Corporate Partner Price</span>
                             <?php else: ?>
                                 <span>Retail Price</span>
-                                <?php if ($wholesalePrice > 0): ?>
+                                <?php if ($initialWholesale > 0): ?>
                                     &bull; <span style="color: var(--brand-primary); font-weight: 500;">B2B Wholesale Available for Corporate Accounts</span>
                                 <?php endif; ?>
                             <?php endif; ?>
                             &bull; 
-                            <span id="stockDisplay" class="<?= $stockQty > 0 ? 'in-stock' : 'out-stock' ?>">
-                                <?= $stockQty > 0 ? "In Stock ({$stockQty})" : 'Out of Stock' ?>
+                            <span id="stockDisplay" class="<?= $initialStock > 0 ? 'in-stock' : 'out-stock' ?>">
+                                <?= $initialStock > 0 ? "In Stock ({$initialStock})" : 'Out of Stock' ?>
                             </span>
                         </div>
                     </div>
@@ -2054,80 +2164,60 @@ try {
                         <input type="hidden" name="item_id" value="<?= $product->id ?>">
                         
                         <!-- Variation Overrides -->
-                        <input type="hidden" name="variation_sku" id="varSku" value="<?= htmlspecialchars($product->item_code ?? '') ?>">
-                        <input type="hidden" name="variation_price" id="varPrice" value="<?= $retailPrice ?>">
-                        <input type="hidden" name="variation_wholesale_price" id="varWholesalePrice" value="<?= $wholesalePrice ?>">
-                        <input type="hidden" name="variation_attribute" id="varAttr" value="">
+                        <input type="hidden" name="variation_sku" id="varSku" value="<?= htmlspecialchars($initialSku) ?>">
+                        <input type="hidden" name="variation_price" id="varPrice" value="<?= $initialRetail ?>">
+                        <input type="hidden" name="variation_wholesale_price" id="varWholesalePrice" value="<?= $initialWholesale ?>">
+                        <input type="hidden" name="variation_attribute" id="varAttr" value="<?= htmlspecialchars($initialAttr) ?>">
 
                         <?php if(!empty($varsList)): ?>
                             <div class="form-group" style="margin-bottom: 24px;">
                                 <label class="form-label">Select Variation / Specification</label>
                                 
                                 <div class="variant-chips-container" id="variantChips">
-                                    <div class="variant-chip active" 
-                                         onclick="selectVariantOption(this, '<?= htmlspecialchars($product->item_code ?? ('SKU-'.$product->id)) ?>', <?= $retailPrice ?>, <?= $wholesalePrice ?>, '', <?= $stockQty ?>, '<?= htmlspecialchars($mainImgSrc) ?>')">
-                                        Standard Configuration
-                                    </div>
-                                    <?php foreach($varsList as $v): 
-                                        $vRetail = floatval($v['price'] ?? $retailPrice);
-                                        $vWholesale = floatval($v['wholesale_price'] ?? $wholesalePrice);
-                                        $vSku = htmlspecialchars($v['sku'] ?? $product->item_code ?? '');
-                                        $vAttr = htmlspecialchars($v['attribute'] ?? $v['name'] ?? $v['value_name'] ?? 'Option');
+                                    <?php foreach($varsList as $vIndex => $v): 
+                                        $vRetail = floatval($v['price'] ?? getItemRetailPrice($product));
+                                        $vWholesale = floatval($v['wholesale_price'] ?? getItemWholesalePrice($product));
+                                        $vSku = $v['sku'] ?? $product->item_code ?? '';
+                                        $vAttr = $v['attribute'] ?? $v['name'] ?? $v['value_name'] ?? ('Option ' . ($vIndex + 1));
                                         $vQty = intval($v['quantity_on_hand'] ?? $v['qty'] ?? $v['stock'] ?? $v['quantity'] ?? 0);
                                         
                                         $vImgPath = $v['image_path'] ?? $v['image'] ?? $v['img'] ?? '';
-                                        $vImgSrc = '';
                                         if (!empty($vImgPath)) {
                                             $vImgSrc = (strpos($vImgPath, 'public/') === 0) 
                                                 ? $erpUrl . substr($vImgPath, 7) 
                                                 : $erpUrl . 'uploads/products/' . $vImgPath;
+                                        } elseif (isset($additionalImgList[$vIndex])) {
+                                            $vImgSrc = $additionalImgList[$vIndex];
                                         } else {
                                             $vImgSrc = $mainImgSrc;
                                         }
+                                        $isActive = ($vIndex === 0);
                                     ?>
-                                        <div class="variant-chip" 
-                                             onclick="selectVariantOption(this, '<?= $vSku ?>', <?= $vRetail ?>, <?= $vWholesale ?>, '<?= addslashes($vAttr) ?>', <?= $vQty ?>, '<?= htmlspecialchars($vImgSrc) ?>')">
-                                            <?= $vAttr ?>
+                                        <div class="variant-chip <?= $isActive ? 'active' : '' ?>" 
+                                             data-sku="<?= htmlspecialchars($vSku, ENT_QUOTES) ?>"
+                                             data-price="<?= $vRetail ?>"
+                                             data-wholesale-price="<?= $vWholesale ?>"
+                                             data-attribute="<?= htmlspecialchars($vAttr, ENT_QUOTES) ?>"
+                                             data-qty="<?= $vQty ?>"
+                                             data-img-src="<?= htmlspecialchars($vImgSrc, ENT_QUOTES) ?>"
+                                             onclick="selectVariantOption(this)">
+                                            <?= htmlspecialchars($vAttr) ?>
                                             <span style="font-size: 11px; opacity: 0.8; margin-left: 4px;">
                                                 (<?= $vQty > 0 ? $vQty : 'Out of stock' ?>)
                                             </span>
                                         </div>
                                     <?php endforeach; ?>
                                 </div>
-
-                                <select id="variationSelect" class="form-control" onchange="updateVariationFromSelect()" style="display:none;">
-                                    <option value="" data-price="<?= $retailPrice ?>" data-wholesale="<?= $wholesalePrice ?>" data-sku="<?= htmlspecialchars($product->item_code ?? '') ?>" data-qty="<?= $stockQty ?>" data-img="<?= htmlspecialchars($mainImgSrc) ?>">Standard Configuration</option>
-                                    <?php foreach($varsList as $v): 
-                                        $vRetail = floatval($v['price'] ?? $retailPrice);
-                                        $vWholesale = floatval($v['wholesale_price'] ?? $wholesalePrice);
-                                        $vSku = htmlspecialchars($v['sku'] ?? $product->item_code ?? '');
-                                        $vAttr = htmlspecialchars($v['attribute'] ?? $v['name'] ?? $v['value_name'] ?? 'Option');
-                                        $vQty = intval($v['quantity_on_hand'] ?? $v['qty'] ?? $v['stock'] ?? $v['quantity'] ?? 0);
-                                        
-                                        $vImgPath = $v['image_path'] ?? $v['image'] ?? $v['img'] ?? '';
-                                        $vImgSrc = !empty($vImgPath) ? ((strpos($vImgPath, 'public/') === 0) ? $erpUrl . substr($vImgPath, 7) : $erpUrl . 'uploads/products/' . $vImgPath) : $mainImgSrc;
-                                    ?>
-                                        <option value="<?= $vSku ?>" 
-                                                data-sku="<?= $vSku ?>" 
-                                                data-price="<?= $vRetail ?>" 
-                                                data-wholesale="<?= $vWholesale ?>"
-                                                data-attr="<?= $vAttr ?>"
-                                                data-qty="<?= $vQty ?>"
-                                                data-img="<?= htmlspecialchars($vImgSrc) ?>"> 
-                                            <?= $vAttr ?> (<?= $vQty > 0 ? $vQty : 'Out of stock' ?>)
-                                        </option>
-                                    <?php endforeach; ?>
-                                </select>
                             </div>
                         <?php endif; ?>
 
                         <div class="qty-row">
                             <div style="width: 120px;">
                                 <label class="form-label" for="qtyInput">Quantity</label>
-                                <input type="number" name="qty" id="qtyInput" class="form-control" value="1" min="1" max="<?= max(1, $stockQty) ?>" style="text-align: center;">
+                                <input type="number" name="qty" id="qtyInput" class="form-control" value="1" min="1" max="<?= max(1, $initialStock) ?>" style="text-align: center;">
                             </div>
-                            <button type="submit" id="addBagBtn" class="btn btn-primary" style="flex-grow: 1; height: 50px;" <?= ($stockQty <= 0) ? 'disabled' : '' ?>>
-                                <?= ($stockQty > 0) ? 'Add to Bag <i class="ph ph-shopping-bag"></i>' : 'Out of Stock <i class="ph ph-x-circle"></i>' ?>
+                            <button type="submit" id="addBagBtn" class="btn btn-primary" style="flex-grow: 1; height: 50px;" <?= ($initialStock <= 0) ? 'disabled' : '' ?>>
+                                <?= ($initialStock > 0) ? 'Add to Bag <i class="ph ph-shopping-bag"></i>' : 'Out of Stock <i class="ph ph-x-circle"></i>' ?>
                             </button>
                         </div>
                     </form>
@@ -2137,10 +2227,30 @@ try {
             <script>
                 const userRole = "<?= $userRole ?>";
 
-                function selectVariantOption(chipEl, sku, price, wholesalePrice, attribute, qty, imgSrc) {
+                function swapGalleryImage(src) {
+                    const mainImg = document.getElementById('mainProductImage');
+                    const emptyIcon = document.getElementById('mainEmptyIcon');
+                    if (src && src.trim() !== '') {
+                        if (mainImg) {
+                            mainImg.src = src;
+                            mainImg.style.display = 'block';
+                        }
+                        if (emptyIcon) emptyIcon.style.display = 'none';
+                    }
+                }
+
+                function selectVariantOption(chipEl) {
+                    if (!chipEl) return;
+                    const sku = chipEl.getAttribute('data-sku') || '';
+                    const price = parseFloat(chipEl.getAttribute('data-price')) || 0;
+                    const wholesalePrice = parseFloat(chipEl.getAttribute('data-wholesale-price')) || 0;
+                    const attribute = chipEl.getAttribute('data-attribute') || '';
+                    const qty = parseInt(chipEl.getAttribute('data-qty')) || 0;
+                    const imgSrc = chipEl.getAttribute('data-img-src') || '';
+
                     const chips = document.querySelectorAll('.variant-chip');
                     chips.forEach(c => c.classList.remove('active'));
-                    if (chipEl) chipEl.classList.add('active');
+                    chipEl.classList.add('active');
 
                     document.getElementById('varSku').value = sku;
                     document.getElementById('varPrice').value = price;
@@ -2155,10 +2265,10 @@ try {
                     const crossWrap = document.getElementById('retailCrossWrap');
                     const crossPrice = document.getElementById('retailCrossPrice');
                     if (userRole === 'wholesaler' && wholesalePrice > 0) {
-                        crossWrap.style.display = 'block';
-                        crossPrice.textContent = 'Rs. ' + price.toFixed(2);
+                        if (crossWrap) crossWrap.style.display = 'block';
+                        if (crossPrice) crossPrice.textContent = 'Rs. ' + price.toFixed(2);
                     } else {
-                        crossWrap.style.display = 'none';
+                        if (crossWrap) crossWrap.style.display = 'none';
                     }
 
                     // Dynamic Stock Status & Add-to-bag button state
@@ -2167,8 +2277,10 @@ try {
                     const qtyInput = document.getElementById('qtyInput');
 
                     if (qty > 0) {
-                        stockEl.className = 'in-stock';
-                        stockEl.textContent = 'In Stock (' + qty + ')';
+                        if (stockEl) {
+                            stockEl.className = 'in-stock';
+                            stockEl.textContent = 'In Stock (' + qty + ')';
+                        }
                         if (addBtn) {
                             addBtn.disabled = false;
                             addBtn.innerHTML = 'Add to Bag <i class="ph ph-shopping-bag"></i>';
@@ -2180,8 +2292,10 @@ try {
                             }
                         }
                     } else {
-                        stockEl.className = 'out-stock';
-                        stockEl.textContent = 'Out of Stock';
+                        if (stockEl) {
+                            stockEl.className = 'out-stock';
+                            stockEl.textContent = 'Out of Stock';
+                        }
                         if (addBtn) {
                             addBtn.disabled = true;
                             addBtn.innerHTML = 'Out of Stock <i class="ph ph-x-circle"></i>';
@@ -2189,35 +2303,9 @@ try {
                     }
 
                     // Dynamic Variation Image Swap Logic
-                    const mainImg = document.getElementById('mainProductImage');
-                    const emptyIcon = document.getElementById('mainEmptyIcon');
-
                     if (imgSrc && imgSrc.trim() !== '') {
-                        if (mainImg) {
-                            mainImg.src = imgSrc;
-                            mainImg.style.display = 'block';
-                        }
-                        if (emptyIcon) {
-                            emptyIcon.style.display = 'none';
-                        }
-                    } else {
-                        if (mainImg && mainImg.getAttribute('data-main-src')) {
-                            mainImg.src = mainImg.getAttribute('data-main-src');
-                        }
+                        swapGalleryImage(imgSrc);
                     }
-                }
-
-                function updateVariationFromSelect() {
-                    const sel = document.getElementById('variationSelect');
-                    if (!sel) return;
-                    const opt = sel.options[sel.selectedIndex];
-                    const sku = opt.getAttribute('data-sku');
-                    const price = parseFloat(opt.getAttribute('data-price')) || 0;
-                    const wholesale = parseFloat(opt.getAttribute('data-wholesale')) || 0;
-                    const attr = opt.getAttribute('data-attr') || '';
-                    const qty = parseInt(opt.getAttribute('data-qty')) || 0;
-                    const img = opt.getAttribute('data-img') || '';
-                    selectVariantOption(null, sku, price, wholesale, attr, qty, img);
                 }
             </script>
 
