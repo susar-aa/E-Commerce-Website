@@ -10,9 +10,13 @@ function logEcError($message, $context = []) {
     $logEntry = "[{$timestamp}] {$message}{$contextStr}\n";
     @file_put_contents($logFile, $logEntry, FILE_APPEND);
 
-    $erpLog = dirname(__DIR__) . '/ERP/app_errors.log';
-    if (file_exists(dirname($erpLog))) {
-        @file_put_contents($erpLog, "[E-COMMERCE {$timestamp}] {$message}{$contextStr}\n", FILE_APPEND);
+    // Safely attempt ERP log write only if open_basedir restriction is not active
+    $openBasedir = ini_get('open_basedir');
+    if (empty($openBasedir)) {
+        $erpLog = dirname(__DIR__) . '/ERP/app_errors.log';
+        if (@file_exists(dirname($erpLog))) {
+            @file_put_contents($erpLog, "[E-COMMERCE {$timestamp}] {$message}{$contextStr}\n", FILE_APPEND);
+        }
     }
 }
 

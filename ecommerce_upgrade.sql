@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS ecommerce_retail_customers (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 3. Ensure Customers table has username and password for Wholesaler B2B login
+-- (Note: Supported natively in MariaDB 10.2+ and MySQL 8.0.19+. If using older MySQL, ignore duplicate column warnings if already added)
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS username VARCHAR(100) UNIQUE NULL AFTER email;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS password VARCHAR(255) NULL AFTER username;
 
