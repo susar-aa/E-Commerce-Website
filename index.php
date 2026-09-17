@@ -1,6 +1,21 @@
 <?php
 session_start();
 
+// Error Logging Utility
+function logEcError($message, $context = []) {
+    $logDir = __DIR__;
+    $logFile = $logDir . '/ec_errors.log';
+    $timestamp = date('Y-m-d H:i:s');
+    $contextStr = !empty($context) ? ' | Context: ' . json_encode($context) : '';
+    $logEntry = "[{$timestamp}] {$message}{$contextStr}\n";
+    @file_put_contents($logFile, $logEntry, FILE_APPEND);
+
+    $erpLog = dirname(__DIR__) . '/ERP/app_errors.log';
+    if (file_exists(dirname($erpLog))) {
+        @file_put_contents($erpLog, "[E-COMMERCE {$timestamp}] {$message}{$contextStr}\n", FILE_APPEND);
+    }
+}
+
 // Database Configuration
 define('DB_HOST', 'localhost');
 define('DB_USER', 'curtiss_erp');
@@ -81,10 +96,11 @@ try {
             }
         }
     } catch (Exception $schemaEx) {
-        // Safe fallback in case of concurrency or lock
+        logEcError("Schema self-healing warning: " . $schemaEx->getMessage());
     }
 
 } catch (PDOException $e) {
+    logEcError("Fatal Database Connection Error: " . $e->getMessage());
     die("<div style='padding:40px; font-family:sans-serif; text-align:center;'>
             <h2 style='color:#ff3b30;'>E-Commerce Offline</h2>
             <p>Could not connect to the Curtiss ERP Database. Please verify settings.</p>
@@ -114,13 +130,31 @@ $isLoggedIn = isset($_SESSION['ec_user_id']);
 $userRole = $_SESSION['ec_role'] ?? 'guest'; // 'retail', 'wholesaler'
 $userName = $_SESSION['ec_name'] ?? '';
 
-// --- HELPER FUNCTION: Get Price for Item ---
-function getItemPrice($item, $role) {
-    if ($role === 'wholesaler') {
-        return (float)($item->wholesale_price ?? 0);
+// --- HELPER FUNCTIONS: Pricing Utilities ---
+function getItemRetailPrice($item) {
+    if (is_array($item)) {
+        return (float)($item['price'] ?? $item['selling_price'] ?? 0);
     }
-    return (float)($item->price ?? 0);
+    return (float)($item->price ?? $item->selling_price ?? 0);
 }
+
+function getItemWholesalePrice($item) {
+    if (is_array($item)) {
+        return (float)($item['wholesale_price'] ?? 0);
+    }
+    return (float)($item->wholesale_price ?? 0);
+}
+
+function getItemPrice($item, $role = 'guest') {
+    $retailPrice = getItemRetailPrice($item);
+    $wholesalePrice = getItemWholesalePrice($item);
+
+    if ($role === 'wholesaler' && $wholesalePrice > 0) {
+        return $wholesalePrice;
+    }
+    return $retailPrice;
+}
+
 
 // Handle Form Submissions
 $message = '';
@@ -254,61 +288,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // 4. ADD TO CART
     if ($action === 'add_to_cart') {
-        $itemId = intval($_POST['item_id'] ?? 0);
-        $qty = intval($_POST['qty'] ?? 1);
-        
-        // Variation options
-        $sku = $_POST['variation_sku'] ?? '';
-        $varPrice = $_POST['variation_price'] ?? null;
-        $varWholesalePrice = $_POST['variation_wholesale_price'] ?? null;
-        $varAttr = $_POST['variation_attribute'] ?? '';
-
-        $stmt = $db->prepare("SELECT * FROM items WHERE id = :id LIMIT 1");
-        $stmt->execute([':id' => $itemId]);
-        $item = $stmt->fetch();
-
-        if ($item) {
-            $price = getItemPrice($item, $userRole);
+        try {
+            $itemId = intval($_POST['item_id'] ?? 0);
+            $qty = intval($_POST['qty'] ?? 1);
             
-            // If variation was selected, override price and SKU
-            if (!empty($sku)) {
-                $price = ($userRole === 'wholesaler') ? (float)$varWholesalePrice : (float)$varPrice;
-            } else {
-                $sku = $item->item_code;
-            }
+            // Variation options
+            $sku = trim($_POST['variation_sku'] ?? '');
+            $varPrice = $_POST['variation_price'] ?? null;
+            $varWholesalePrice = $_POST['variation_wholesale_price'] ?? null;
+            $varAttr = trim($_POST['variation_attribute'] ?? '');
 
-            $cartKey = $itemId . '_' . md5($sku);
+            $stmt = $db->prepare("SELECT * FROM items WHERE id = :id LIMIT 1");
+            $stmt->execute([':id' => $itemId]);
+            $item = $stmt->fetch();
 
-            if (isset($_SESSION['ec_cart'][$cartKey])) {
-                $_SESSION['ec_cart'][$cartKey]['qty'] += $qty;
+            if ($item) {
+                $retailPrice = getItemRetailPrice($item);
+                $wholesalePrice = getItemWholesalePrice($item);
+                $price = getItemPrice($item, $userRole);
+                
+                // If variation was selected, override price and SKU
+                if (!empty($sku)) {
+                    $vPrice = floatval($varPrice > 0 ? $varPrice : $retailPrice);
+                    $vWholesale = floatval($varWholesalePrice > 0 ? $varWholesalePrice : $wholesalePrice);
+                    $price = ($userRole === 'wholesaler' && $vWholesale > 0) ? $vWholesale : $vPrice;
+                    $retailPrice = $vPrice;
+                    $wholesalePrice = $vWholesale;
+                } else {
+                    $sku = $item->item_code ?? ('SKU-' . $item->id);
+                }
+
+                $cartKey = $itemId . '_' . md5($sku . '_' . $varAttr);
+
+                if (isset($_SESSION['ec_cart'][$cartKey])) {
+                    $_SESSION['ec_cart'][$cartKey]['qty'] += $qty;
+                } else {
+                    $_SESSION['ec_cart'][$cartKey] = [
+                        'item_id' => $item->id,
+                        'name' => $item->name,
+                        'sku' => $sku,
+                        'attribute' => $varAttr,
+                        'price' => $price,
+                        'retail_price' => $retailPrice,
+                        'wholesale_price' => $wholesalePrice,
+                        'qty' => $qty,
+                        'image_path' => $item->image_path
+                    ];
+                }
+                header('Location: index.php?p=cart');
+                exit;
             } else {
-                $_SESSION['ec_cart'][$cartKey] = [
-                    'item_id' => $item->id,
-                    'name' => $item->name,
-                    'sku' => $sku,
-                    'attribute' => $varAttr,
-                    'price' => $price,
-                    'qty' => $qty,
-                    'image_path' => $item->image_path
-                ];
+                $error = 'The requested product could not be found.';
             }
-            header('Location: index.php?p=cart');
-            exit;
+        } catch (Exception $e) {
+            logEcError("Failed to add item to cart: " . $e->getMessage(), ['item_id' => $_POST['item_id'] ?? 0]);
+            $error = 'An unexpected error occurred while adding item to cart.';
         }
     }
 
     // 5. UPDATE CART
     if ($action === 'update_cart') {
-        foreach ($_POST['qty'] as $cartKey => $newQty) {
-            $newQty = intval($newQty);
-            if ($newQty <= 0) {
-                unset($_SESSION['ec_cart'][$cartKey]);
-            } else {
-                $_SESSION['ec_cart'][$cartKey]['qty'] = $newQty;
+        try {
+            foreach ($_POST['qty'] as $cartKey => $newQty) {
+                $newQty = intval($newQty);
+                if ($newQty <= 0) {
+                    unset($_SESSION['ec_cart'][$cartKey]);
+                } else {
+                    $_SESSION['ec_cart'][$cartKey]['qty'] = $newQty;
+                }
             }
+            header('Location: index.php?p=cart');
+            exit;
+        } catch (Exception $e) {
+            logEcError("Failed to update cart: " . $e->getMessage());
+            $error = 'An error occurred while updating cart.';
         }
-        header('Location: index.php?p=cart');
-        exit;
     }
 
     // 6. CHECKOUT ORDER SUBMIT
@@ -346,7 +400,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $customerPhone = $cRow->phone ?? '';
                 } else {
                     // Create generic Walk-in customer or fetch/create 'E-Commerce Retail' profile in ERP
-                    // We can check if a retail customer profile with name 'E-Commerce Retail Customer' exists
                     $cStmt = $db->query("SELECT id FROM customers WHERE name = 'E-Commerce Retail Customer' LIMIT 1");
                     $cRow = $cStmt->fetch();
                     if ($cRow) {
@@ -402,14 +455,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $page = 'order_success';
             } catch (Exception $e) {
                 $db->rollBack();
+                logEcError("Order placement failed: " . $e->getMessage(), ['cart' => $_SESSION['ec_cart'] ?? []]);
                 $error = 'Failed to submit order: ' . $e->getMessage();
             }
         }
     }
 }
 
-// Fetch categories for shop filter
-$categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fetchAll();
+// Fetch categories with live product counts for shop filter and homepage
+try {
+    $categories = $db->query("
+        SELECT c.*, COUNT(i.id) AS product_count 
+        FROM item_categories c 
+        LEFT JOIN items i ON i.category_id = c.id AND (i.status IS NULL OR i.status = '' OR i.status = 'active' OR i.status != 'deleted')
+        GROUP BY c.id 
+        ORDER BY c.name ASC
+    ")->fetchAll();
+} catch (Exception $e) {
+    logEcError("Failed to fetch categories: " . $e->getMessage());
+    $categories = [];
+}
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1311,6 +1377,154 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
             font-size: 14px;
         }
 
+        /* UPGRADED E-COMMERCE COMPONENTS (Variations, Badges, Pagination, Price Tags) */
+        .cat-count {
+            display: inline-block;
+            background: var(--bg-subtle);
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: var(--radius-full);
+            margin-left: 6px;
+        }
+
+        .product-badge-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .badge-variation {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: #EBF8FF;
+            color: #2B6CB0;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: var(--radius-sm);
+        }
+
+        .badge-b2b {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: #FEFCBF;
+            color: #744210;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: var(--radius-sm);
+        }
+
+        .badge-cat {
+            display: inline-block;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--brand-accent);
+            font-weight: 600;
+        }
+
+        .price-cross {
+            text-decoration: line-through;
+            color: var(--text-muted);
+            font-size: 13px;
+            margin-right: 6px;
+            font-weight: normal;
+        }
+
+        .wholesaler-price-tag {
+            color: var(--brand-primary);
+            font-weight: 700;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            margin-top: 40px;
+            flex-wrap: wrap;
+        }
+
+        .page-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 40px;
+            height: 40px;
+            padding: 0 14px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-light);
+            background: var(--bg-card);
+            color: var(--text-main);
+            font-size: 14px;
+            font-weight: 500;
+            transition: var(--transition-smooth);
+        }
+
+        .page-link:hover {
+            border-color: var(--brand-primary);
+            color: var(--brand-primary);
+        }
+
+        .page-link.active {
+            background: var(--brand-primary);
+            color: #ffffff;
+            border-color: var(--brand-primary);
+        }
+
+        .page-link.disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+
+        .sort-select {
+            padding: 8px 16px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-light);
+            background: var(--bg-card);
+            color: var(--text-main);
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .variant-chips-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 8px;
+            margin-bottom: 20px;
+        }
+
+        .variant-chip {
+            padding: 10px 18px;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-md);
+            background: var(--bg-card);
+            color: var(--text-main);
+            font-size: 13px;
+            cursor: pointer;
+            transition: var(--transition-smooth);
+            user-select: none;
+        }
+
+        .variant-chip:hover {
+            border-color: var(--brand-primary);
+        }
+
+        .variant-chip.active {
+            border-color: var(--brand-primary);
+            background: var(--brand-primary);
+            color: #ffffff;
+            font-weight: 600;
+        }
+
+
         /* RESPONSIVE OVERRIDES */
         @media (max-width: 1024px) {
             .shop-container { grid-template-columns: 1fr; }
@@ -1516,35 +1730,99 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
         // PAGE: SHOP
         // ==========================================
         elseif ($page === 'shop'):
-            $catFilter = $_GET['category'] ?? null;
-            $search = $_GET['q'] ?? '';
+            $catFilter = isset($_GET['category']) ? intval($_GET['category']) : null;
+            $search = trim($_GET['q'] ?? '');
+            $sort = $_GET['sort'] ?? 'name_asc';
+            $pageNo = max(1, intval($_GET['page'] ?? 1));
+            $perPage = 16;
+            $offset = ($pageNo - 1) * $perPage;
 
-            $sql = "SELECT * FROM items WHERE status = 'active'";
+            $where = ["(status IS NULL OR status = '' OR status = 'active' OR status != 'deleted')"];
             $params = [];
             if ($catFilter) {
-                $sql .= " AND category_id = :cat";
+                $where[] = "category_id = :cat";
                 $params[':cat'] = $catFilter;
             }
             if (!empty($search)) {
-                $sql .= " AND (name LIKE :search OR item_code LIKE :search)";
+                $where[] = "(name LIKE :search OR item_code LIKE :search OR description LIKE :search)";
                 $params[':search'] = '%' . $search . '%';
             }
-            $sql .= " ORDER BY name ASC";
 
-            $stmt = $db->prepare($sql);
-            $stmt->execute($params);
-            $products = $stmt->fetchAll();
+            $whereSql = "WHERE " . implode(" AND ", $where);
+
+            // Fetch Total for Pagination
+            try {
+                $countStmt = $db->prepare("SELECT COUNT(*) AS total FROM items {$whereSql}");
+                $countStmt->execute($params);
+                $totalProducts = (int)($countStmt->fetch()->total ?? 0);
+            } catch (Exception $e) {
+                logEcError("Failed to count products for pagination: " . $e->getMessage());
+                $totalProducts = 0;
+            }
+
+            $totalPages = max(1, ceil($totalProducts / $perPage));
+
+            // Sorting SQL
+            $orderBy = "name ASC";
+            if ($sort === 'price_low_high') {
+                $orderBy = "CAST(price AS DECIMAL(10,2)) ASC";
+            } elseif ($sort === 'price_high_low') {
+                $orderBy = "CAST(price AS DECIMAL(10,2)) DESC";
+            } elseif ($sort === 'newest') {
+                $orderBy = "id DESC";
+            }
+
+            try {
+                $sql = "SELECT i.*, cat.name AS category_name 
+                        FROM items i 
+                        LEFT JOIN item_categories cat ON i.category_id = cat.id 
+                        {$whereSql} 
+                        ORDER BY {$orderBy} 
+                        LIMIT :limit OFFSET :offset";
+                $stmt = $db->prepare($sql);
+                foreach ($params as $k => $v) {
+                    $stmt->bindValue($k, $v);
+                }
+                $stmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
+                $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+                $stmt->execute();
+                $products = $stmt->fetchAll();
+            } catch (Exception $e) {
+                logEcError("Failed to fetch products for shop: " . $e->getMessage());
+                $products = [];
+            }
         ?>
             <div class="shop-header">
-                <h1 style="font-size: 32px;">Our Collection</h1>
-                <form action="index.php" method="GET" class="search-bar">
-                    <input type="hidden" name="p" value="shop">
-                    <?php if($catFilter): ?>
-                        <input type="hidden" name="category" value="<?= $catFilter ?>">
-                    <?php endif; ?>
-                    <input type="text" name="q" class="form-control" placeholder="Search fine items..." value="<?= htmlspecialchars($search) ?>">
-                    <button type="submit" aria-label="Search"><i class="ph ph-magnifying-glass"></i></button>
-                </form>
+                <div>
+                    <h1 style="font-size: 32px;">Our Complete Collection</h1>
+                    <p style="color: var(--text-muted); font-size: 14px; margin-top: 4px;">Explore fine stationery, journals, writing instruments & desk accessories.</p>
+                </div>
+
+                <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+                    <form action="index.php" method="GET" class="search-bar" style="max-width: 320px;">
+                        <input type="hidden" name="p" value="shop">
+                        <?php if($catFilter): ?>
+                            <input type="hidden" name="category" value="<?= $catFilter ?>">
+                        <?php endif; ?>
+                        <?php if($sort): ?>
+                            <input type="hidden" name="sort" value="<?= htmlspecialchars($sort) ?>">
+                        <?php endif; ?>
+                        <input type="text" name="q" class="form-control" placeholder="Search products..." value="<?= htmlspecialchars($search) ?>">
+                        <button type="submit" aria-label="Search"><i class="ph ph-magnifying-glass"></i></button>
+                    </form>
+
+                    <form action="index.php" method="GET">
+                        <input type="hidden" name="p" value="shop">
+                        <?php if($catFilter): ?><input type="hidden" name="category" value="<?= $catFilter ?>"><?php endif; ?>
+                        <?php if(!empty($search)): ?><input type="hidden" name="q" value="<?= htmlspecialchars($search) ?>"><?php endif; ?>
+                        <select name="sort" class="sort-select" onchange="this.form.submit()">
+                            <option value="name_asc" <?= $sort === 'name_asc' ? 'selected' : '' ?>>Sort: Name A-Z</option>
+                            <option value="price_low_high" <?= $sort === 'price_low_high' ? 'selected' : '' ?>>Price: Low to High</option>
+                            <option value="price_high_low" <?= $sort === 'price_high_low' ? 'selected' : '' ?>>Price: High to Low</option>
+                            <option value="newest" <?= $sort === 'newest' ? 'selected' : '' ?>>Sort: Newest Arrivals</option>
+                        </select>
+                    </form>
+                </div>
             </div>
 
             <div class="shop-container">
@@ -1553,14 +1831,15 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
                     <h4 class="sidebar-title">Categories</h4>
                     <ul class="filter-list">
                         <li>
-                            <a href="index.php?p=shop" class="<?= !$catFilter ? 'active' : '' ?>">
-                                All Items
+                            <a href="index.php?p=shop<?= !empty($search) ? '&q='.urlencode($search) : '' ?>" class="<?= !$catFilter ? 'active' : '' ?>">
+                                All Items <span class="cat-count"><?= $totalProducts ?></span>
                             </a>
                         </li>
                         <?php foreach($categories as $cat): ?>
                             <li>
-                                <a href="index.php?p=shop&category=<?= $cat->id ?>" class="<?= $catFilter == $cat->id ? 'active' : '' ?>">
+                                <a href="index.php?p=shop&category=<?= $cat->id ?><?= !empty($search) ? '&q='.urlencode($search) : '' ?>" class="<?= $catFilter == $cat->id ? 'active' : '' ?>">
                                     <?= htmlspecialchars($cat->name) ?>
+                                    <span class="cat-count"><?= (int)($cat->product_count ?? 0) ?></span>
                                 </a>
                             </li>
                         <?php endforeach; ?>
@@ -1569,18 +1848,27 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
 
                 <!-- Products Grid -->
                 <main>
-                    <div style="margin-bottom: 24px; color: var(--text-muted); font-size: 14px;">
-                        Showing <?= count($products) ?> items
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; color: var(--text-muted); font-size: 14px;">
+                        <div>Showing <?= count($products) ?> of <?= $totalProducts ?> items</div>
+                        <?php if ($totalPages > 1): ?>
+                            <div>Page <?= $pageNo ?> of <?= $totalPages ?></div>
+                        <?php endif; ?>
                     </div>
                     
                     <div class="product-grid">
                         <?php if(empty($products)): ?>
                             <div style="grid-column: 1/-1; text-align: center; padding: 64px 0; color: var(--text-muted);">
                                 <i class="ph-light ph-wind" style="font-size: 48px; margin-bottom: 16px;"></i>
-                                <p>No pieces found matching your criteria.</p>
+                                <p>No products found matching your criteria.</p>
                             </div>
                         <?php else: ?>
-                            <?php foreach($products as $prod): ?>
+                            <?php foreach($products as $prod): 
+                                $hasVariations = !empty($prod->variations_json) && $prod->variations_json !== '[]';
+                                $retailPrice = getItemRetailPrice($prod);
+                                $wholesalePrice = getItemWholesalePrice($prod);
+                                $activePrice = getItemPrice($prod, $userRole);
+                                $qtyOnStock = intval($prod->quantity_on_hand ?? $prod->qty ?? 0);
+                            ?>
                                 <a href="index.php?p=product&id=<?= $prod->id ?>" class="product-card">
                                     <div class="product-img-wrapper">
                                         <?php if(!empty($prod->image_path)): ?>
@@ -1596,19 +1884,63 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
                                             <i class="ph-light ph-image empty-img"></i>
                                         <?php endif; ?>
                                     </div>
-                                    <div class="product-brand"><?= htmlspecialchars($prod->brand ?? 'Lumière Exclusive') ?></div>
+                                    
+                                    <div class="product-badge-group">
+                                        <?php if (!empty($prod->category_name)): ?>
+                                            <span class="badge-cat"><?= htmlspecialchars($prod->category_name) ?></span>
+                                        <?php endif; ?>
+                                        <?php if ($hasVariations): ?>
+                                            <span class="badge-variation"><i class="ph ph-sliders"></i> Options</span>
+                                        <?php endif; ?>
+                                    </div>
+
+                                    <div class="product-brand"><?= htmlspecialchars($prod->brand ?? 'Lumière Premium') ?></div>
                                     <h3 class="product-title"><?= htmlspecialchars($prod->name) ?></h3>
                                     
                                     <div class="product-footer">
-                                        <div class="product-price">Rs. <?= number_format(getItemPrice($prod, $userRole), 2) ?></div>
-                                        <div class="stock-indicator <?= $prod->qty > 0 ? 'in-stock' : 'out-stock' ?>">
-                                            <?= $prod->qty > 0 ? 'Available' : 'Sold Out' ?>
+                                        <div class="product-price">
+                                            <?php if ($userRole === 'wholesaler' && $wholesalePrice > 0): ?>
+                                                <span class="price-cross">Rs. <?= number_format($retailPrice, 2) ?></span>
+                                                <span class="wholesaler-price-tag">Rs. <?= number_format($wholesalePrice, 2) ?></span>
+                                            <?php else: ?>
+                                                <span>Rs. <?= number_format($retailPrice, 2) ?></span>
+                                            <?php endif; ?>
+                                        </div>
+                                        <div class="stock-indicator <?= $qtyOnStock > 0 ? 'in-stock' : 'out-stock' ?>">
+                                            <?= $qtyOnStock > 0 ? 'Available' : 'Sold Out' ?>
                                         </div>
                                     </div>
                                 </a>
                             <?php endforeach; ?>
                         <?php endif; ?>
                     </div>
+
+                    <!-- Pagination Controls -->
+                    <?php if ($totalPages > 1): ?>
+                        <div class="pagination">
+                            <?php if ($pageNo > 1): ?>
+                                <a href="index.php?p=shop&page=<?= $pageNo - 1 ?><?= $catFilter ? '&category='.$catFilter : '' ?><?= !empty($search) ? '&q='.urlencode($search) : '' ?><?= '&sort='.$sort ?>" class="page-link"><i class="ph ph-caret-left"></i> Prev</a>
+                            <?php else: ?>
+                                <span class="page-link disabled"><i class="ph ph-caret-left"></i> Prev</span>
+                            <?php endif; ?>
+
+                            <?php for ($p = 1; $p <= $totalPages; $p++): ?>
+                                <?php if ($p == 1 || $p == $totalPages || abs($p - $pageNo) <= 2): ?>
+                                    <a href="index.php?p=shop&page=<?= $p ?><?= $catFilter ? '&category='.$catFilter : '' ?><?= !empty($search) ? '&q='.urlencode($search) : '' ?><?= '&sort='.$sort ?>" class="page-link <?= $p == $pageNo ? 'active' : '' ?>">
+                                        <?= $p ?>
+                                    </a>
+                                <?php elseif (abs($p - $pageNo) == 3): ?>
+                                    <span class="page-link disabled">&hellip;</span>
+                                <?php endif; ?>
+                            <?php endfor; ?>
+
+                            <?php if ($pageNo < $totalPages): ?>
+                                <a href="index.php?p=shop&page=<?= $pageNo + 1 ?><?= $catFilter ? '&category='.$catFilter : '' ?><?= !empty($search) ? '&q='.urlencode($search) : '' ?><?= '&sort='.$sort ?>" class="page-link">Next <i class="ph ph-caret-right"></i></a>
+                            <?php else: ?>
+                                <span class="page-link disabled">Next <i class="ph ph-caret-right"></i></span>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
                 </main>
             </div>
 
@@ -1618,14 +1950,29 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
         // ==========================================
         elseif ($page === 'product'):
             $prodId = intval($_GET['id'] ?? 0);
-            $stmt = $db->prepare("SELECT * FROM items WHERE id = :id LIMIT 1");
-            $stmt->execute([':id' => $prodId]);
-            $product = $stmt->fetch();
+            try {
+                $stmt = $db->prepare("
+                    SELECT i.*, cat.name AS category_name 
+                    FROM items i 
+                    LEFT JOIN item_categories cat ON i.category_id = cat.id 
+                    WHERE i.id = :id LIMIT 1
+                ");
+                $stmt->execute([':id' => $prodId]);
+                $product = $stmt->fetch();
+            } catch (Exception $e) {
+                logEcError("Failed to fetch product details for ID {$prodId}: " . $e->getMessage());
+                $product = null;
+            }
 
             if (!$product) {
-                echo "<div style='padding: 100px 0; text-align: center;'><h2>Product not found</h2></div>";
+                echo "<div style='padding: 100px 0; text-align: center;'><h2>Product not found</h2><p style='color:var(--text-muted); margin-top:12px;'><a href='index.php?p=shop' class='btn btn-primary'>Return to Store</a></p></div>";
             } else {
                 $varsList = json_decode($product->variations_json ?? '[]', true);
+                if (!is_array($varsList)) $varsList = [];
+
+                $retailPrice = getItemRetailPrice($product);
+                $wholesalePrice = getItemWholesalePrice($product);
+                $stockQty = intval($product->quantity_on_hand ?? $product->qty ?? 0);
         ?>
             <div class="detail-layout">
                 <!-- Gallery Left -->
@@ -1646,51 +1993,94 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
 
                 <!-- Info Right -->
                 <div class="detail-info">
-                    <span class="detail-brand"><?= htmlspecialchars($product->brand ?? 'Lumière Exclusive') ?></span>
+                    <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;">
+                        <span class="detail-brand"><?= htmlspecialchars($product->brand ?? 'Lumière Exclusive') ?></span>
+                        <?php if (!empty($product->category_name)): ?>
+                            &bull; <span class="badge-cat"><?= htmlspecialchars($product->category_name) ?></span>
+                        <?php endif; ?>
+                        <?php if (!empty($varsList)): ?>
+                            &bull; <span class="badge-variation"><i class="ph ph-sliders"></i> Variable Item</span>
+                        <?php endif; ?>
+                    </div>
+
                     <h1 class="detail-title"><?= htmlspecialchars($product->name) ?></h1>
-                    
-                    <div class="detail-price-wrap">
-                        <div class="detail-price" id="priceDisplay">
-                            Rs. <?= number_format(getItemPrice($product, $userRole), 2) ?>
+                    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">SKU: <span id="skuDisplay"><?= htmlspecialchars($product->item_code ?? ('SKU-'.$product->id)) ?></span></div>
+
+                    <div class="detail-price-wrap" style="padding: 20px; background: var(--bg-subtle); border-radius: var(--radius-md); border: 1px solid var(--border-light);">
+                        <div style="display: flex; align-items: baseline; gap: 12px;">
+                            <div class="detail-price" id="priceDisplay">
+                                <?php if ($userRole === 'wholesaler' && $wholesalePrice > 0): ?>
+                                    Rs. <?= number_format($wholesalePrice, 2) ?>
+                                <?php else: ?>
+                                    Rs. <?= number_format($retailPrice, 2) ?>
+                                <?php endif; ?>
+                            </div>
+
+                            <div id="retailCrossWrap" style="<?= ($userRole === 'wholesaler' && $wholesalePrice > 0) ? 'display:block;' : 'display:none;' ?>">
+                                <span class="price-cross" id="retailCrossPrice">Rs. <?= number_format($retailPrice, 2) ?></span>
+                            </div>
                         </div>
-                        <div style="font-size: 13px; color: var(--text-muted);">
+
+                        <div style="font-size: 13px; color: var(--text-muted); margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
                             <?php if($userRole === 'wholesaler'): ?>
-                                Corporate Partner Pricing Applied
+                                <span class="badge-b2b"><i class="ph ph-check-circle"></i> Corporate Partner Price</span>
                             <?php else: ?>
-                                Standard Pricing
+                                <span>Retail Price</span>
+                                <?php if ($wholesalePrice > 0): ?>
+                                    &bull; <span style="color: var(--brand-primary); font-weight: 500;">B2B Wholesale Available for Corporate Accounts</span>
+                                <?php endif; ?>
                             <?php endif; ?>
                             &bull; 
-                            <span class="<?= $product->qty > 0 ? 'in-stock' : 'out-stock' ?>" style="color: inherit;">
-                                <?= $product->qty > 0 ? "In Stock ({$product->qty})" : 'Out of Stock' ?>
+                            <span id="stockDisplay" class="<?= $stockQty > 0 ? 'in-stock' : 'out-stock' ?>">
+                                <?= $stockQty > 0 ? "In Stock ({$stockQty})" : 'Out of Stock' ?>
                             </span>
                         </div>
                     </div>
 
-                    <div class="detail-desc">
-                        <?= nl2br(htmlspecialchars($product->description ?? 'An exquisite addition to your collection. Refined materials and careful craftsmanship define this piece.')) ?>
+                    <div class="detail-desc" style="margin: 24px 0;">
+                        <?= nl2br(htmlspecialchars($product->description ?? 'An exquisite stationery addition. Refined materials and careful craftsmanship define this piece.')) ?>
                     </div>
 
                     <form action="index.php?p=product&id=<?= $product->id ?>" method="POST" class="detail-form">
                         <input type="hidden" name="action" value="add_to_cart">
                         <input type="hidden" name="item_id" value="<?= $product->id ?>">
                         
-                        <!-- Variation Overrides (Required for Backend Logic) -->
-                        <input type="hidden" name="variation_sku" id="varSku">
-                        <input type="hidden" name="variation_price" id="varPrice">
-                        <input type="hidden" name="variation_wholesale_price" id="varWholesalePrice">
-                        <input type="hidden" name="variation_attribute" id="varAttr">
+                        <!-- Variation Overrides -->
+                        <input type="hidden" name="variation_sku" id="varSku" value="<?= htmlspecialchars($product->item_code ?? '') ?>">
+                        <input type="hidden" name="variation_price" id="varPrice" value="<?= $retailPrice ?>">
+                        <input type="hidden" name="variation_wholesale_price" id="varWholesalePrice" value="<?= $wholesalePrice ?>">
+                        <input type="hidden" name="variation_attribute" id="varAttr" value="">
 
                         <?php if(!empty($varsList)): ?>
-                            <div class="form-group">
-                                <label class="form-label" for="variationSelect">Select Specification</label>
-                                <select id="variationSelect" class="form-control" onchange="updateVariation()">
-                                    <option value="" data-price="<?= $product->price ?>" data-wholesale="<?= $product->wholesale_price ?>" data-sku="<?= $product->item_code ?>" data-qty="<?= $product->qty ?>">Standard Configuration</option>
+                            <div class="form-group" style="margin-bottom: 24px;">
+                                <label class="form-label">Select Variation / Specification</label>
+                                
+                                <div class="variant-chips-container" id="variantChips">
+                                    <div class="variant-chip active" 
+                                         onclick="selectVariantOption(this, '<?= htmlspecialchars($product->item_code) ?>', <?= $retailPrice ?>, <?= $wholesalePrice ?>, '', <?= $stockQty ?>)">
+                                        Standard Configuration
+                                    </div>
+                                    <?php foreach($varsList as $v): 
+                                        $vRetail = floatval($v['price'] ?? $retailPrice);
+                                        $vWholesale = floatval($v['wholesale_price'] ?? $wholesalePrice);
+                                        $vSku = htmlspecialchars($v['sku'] ?? $product->item_code);
+                                        $vAttr = htmlspecialchars($v['attribute'] ?? 'Option');
+                                    ?>
+                                        <div class="variant-chip" 
+                                             onclick="selectVariantOption(this, '<?= $vSku ?>', <?= $vRetail ?>, <?= $vWholesale ?>, '<?= $vAttr ?>', 10)">
+                                            <?= $vAttr ?>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+
+                                <select id="variationSelect" class="form-control" onchange="updateVariationFromSelect()" style="display:none;">
+                                    <option value="" data-price="<?= $retailPrice ?>" data-wholesale="<?= $wholesalePrice ?>" data-sku="<?= htmlspecialchars($product->item_code) ?>" data-qty="<?= $stockQty ?>">Standard Configuration</option>
                                     <?php foreach($varsList as $v): ?>
                                         <option value="<?= htmlspecialchars($v['sku']) ?>" 
                                                 data-sku="<?= htmlspecialchars($v['sku']) ?>" 
-                                                data-price="<?= $v['price'] ?>" 
-                                                data-wholesale="<?= $v['wholesale_price'] ?>"
-                                                data-attr="<?= htmlspecialchars($v['attribute']) ?>"
+                                                data-price="<?= floatval($v['price'] ?? 0) ?>" 
+                                                data-wholesale="<?= floatval($v['wholesale_price'] ?? 0) ?>"
+                                                data-attr="<?= htmlspecialchars($v['attribute'] ?? '') ?>"
                                                 data-qty="10"> 
                                             <?= htmlspecialchars($v['attribute']) ?>
                                         </option>
@@ -1702,9 +2092,9 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
                         <div class="qty-row">
                             <div style="width: 120px;">
                                 <label class="form-label" for="qtyInput">Quantity</label>
-                                <input type="number" name="qty" id="qtyInput" class="form-control" value="1" min="1" max="<?= max(1, $product->qty) ?>" style="text-align: center;">
+                                <input type="number" name="qty" id="qtyInput" class="form-control" value="1" min="1" max="<?= max(1, $stockQty) ?>" style="text-align: center;">
                             </div>
-                            <button type="submit" class="btn btn-primary" style="flex-grow: 1; height: 50px;" <?= ($product->qty <= 0) ? 'disabled' : '' ?>>
+                            <button type="submit" id="addBagBtn" class="btn btn-primary" style="flex-grow: 1; height: 50px;" <?= ($stockQty <= 0) ? 'disabled' : '' ?>>
                                 Add to Bag <i class="ph ph-shopping-bag"></i>
                             </button>
                         </div>
@@ -1713,26 +2103,55 @@ $categories = $db->query("SELECT * FROM item_categories ORDER BY name ASC")->fet
             </div>
 
             <script>
-                function updateVariation() {
-                    const sel = document.getElementById('variationSelect');
-                    if(!sel) return;
-                    
-                    const opt = sel.options[sel.selectedIndex];
-                    const sku = opt.getAttribute('data-sku');
-                    const price = parseFloat(opt.getAttribute('data-price'));
-                    const wholesale = parseFloat(opt.getAttribute('data-wholesale'));
-                    const attr = opt.getAttribute('data-attr') || '';
-                    const role = "<?= $userRole ?>";
+                const userRole = "<?= $userRole ?>";
+
+                function selectVariantOption(chipEl, sku, price, wholesalePrice, attribute, qty) {
+                    const chips = document.querySelectorAll('.variant-chip');
+                    chips.forEach(c => c.classList.remove('active'));
+                    if (chipEl) chipEl.classList.add('active');
 
                     document.getElementById('varSku').value = sku;
                     document.getElementById('varPrice').value = price;
-                    document.getElementById('varWholesalePrice').value = wholesale;
-                    document.getElementById('varAttr').value = attr;
+                    document.getElementById('varWholesalePrice').value = wholesalePrice;
+                    document.getElementById('varAttr').value = attribute;
 
-                    const selectedPrice = (role === 'wholesaler') ? wholesale : price;
-                    document.getElementById('priceDisplay').textContent = 'Rs. ' + selectedPrice.toFixed(2);
+                    document.getElementById('skuDisplay').textContent = sku;
+
+                    const displayPrice = (userRole === 'wholesaler' && wholesalePrice > 0) ? wholesalePrice : price;
+                    document.getElementById('priceDisplay').textContent = 'Rs. ' + displayPrice.toFixed(2);
+
+                    const crossWrap = document.getElementById('retailCrossWrap');
+                    const crossPrice = document.getElementById('retailCrossPrice');
+                    if (userRole === 'wholesaler' && wholesalePrice > 0) {
+                        crossWrap.style.display = 'block';
+                        crossPrice.textContent = 'Rs. ' + price.toFixed(2);
+                    } else {
+                        crossWrap.style.display = 'none';
+                    }
+
+                    const stockEl = document.getElementById('stockDisplay');
+                    if (qty > 0) {
+                        stockEl.className = 'in-stock';
+                        stockEl.textContent = 'In Stock (' + qty + ')';
+                    } else {
+                        stockEl.className = 'out-stock';
+                        stockEl.textContent = 'Out of Stock';
+                    }
+                }
+
+                function updateVariationFromSelect() {
+                    const sel = document.getElementById('variationSelect');
+                    if (!sel) return;
+                    const opt = sel.options[sel.selectedIndex];
+                    const sku = opt.getAttribute('data-sku');
+                    const price = parseFloat(opt.getAttribute('data-price')) || 0;
+                    const wholesale = parseFloat(opt.getAttribute('data-wholesale')) || 0;
+                    const attr = opt.getAttribute('data-attr') || '';
+                    const qty = parseInt(opt.getAttribute('data-qty')) || 0;
+                    selectVariantOption(null, sku, price, wholesale, attr, qty);
                 }
             </script>
+
         <?php
             }
 
