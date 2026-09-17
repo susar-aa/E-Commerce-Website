@@ -1741,14 +1741,14 @@ try {
             $perPage = 16;
             $offset = ($pageNo - 1) * $perPage;
 
-            $where = ["(status IS NULL OR status = '' OR status = 'active' OR status != 'deleted')"];
+            $where = ["(i.status IS NULL OR i.status = '' OR i.status = 'active' OR i.status != 'deleted')"];
             $params = [];
             if ($catFilter) {
-                $where[] = "category_id = :cat";
+                $where[] = "i.category_id = :cat";
                 $params[':cat'] = $catFilter;
             }
             if (!empty($search)) {
-                $where[] = "(name LIKE :search OR item_code LIKE :search OR description LIKE :search)";
+                $where[] = "(i.name LIKE :search OR i.item_code LIKE :search OR i.description LIKE :search)";
                 $params[':search'] = '%' . $search . '%';
             }
 
@@ -1756,7 +1756,7 @@ try {
 
             // Fetch Total for Pagination
             try {
-                $countStmt = $db->prepare("SELECT COUNT(*) AS total FROM items {$whereSql}");
+                $countStmt = $db->prepare("SELECT COUNT(*) AS total FROM items i {$whereSql}");
                 $countStmt->execute($params);
                 $totalProducts = (int)($countStmt->fetch()->total ?? 0);
             } catch (Exception $e) {
@@ -1767,13 +1767,13 @@ try {
             $totalPages = max(1, ceil($totalProducts / $perPage));
 
             // Sorting SQL
-            $orderBy = "name ASC";
+            $orderBy = "i.name ASC";
             if ($sort === 'price_low_high') {
-                $orderBy = "CAST(price AS DECIMAL(10,2)) ASC";
+                $orderBy = "CAST(i.price AS DECIMAL(10,2)) ASC";
             } elseif ($sort === 'price_high_low') {
-                $orderBy = "CAST(price AS DECIMAL(10,2)) DESC";
+                $orderBy = "CAST(i.price AS DECIMAL(10,2)) DESC";
             } elseif ($sort === 'newest') {
-                $orderBy = "id DESC";
+                $orderBy = "i.id DESC";
             }
 
             try {
